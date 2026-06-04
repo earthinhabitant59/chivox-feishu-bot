@@ -21,17 +21,22 @@ module.exports = async (req, res) => {
   }
 
   try {
-    // 1. 下载飞书附件
-    console.log('下载附件 fileToken:', fileToken);
-    const audioBuffer = await downloadFeishuFile(fileToken, feishuToken);
+    // 1. 用fileToken换取临时下载URL
+    console.log('获取临时下载URL, fileToken:', fileToken);
+    const tmpUrl = await getFeishuTmpUrl(fileToken, feishuToken);
+    console.log('临时URL获取成功');
+
+    // 2. 下载文件
+    console.log('下载附件...');
+    const audioBuffer = await downloadFile(tmpUrl, feishuToken);
     console.log('附件下载完成，大小:', audioBuffer.length, 'bytes');
 
-    // 2. 驰声评测
+    // 3. 驰声评测
     console.log('开始驰声评测...');
     const assessResult = await chivoxAssess(audioBuffer, text);
     console.log('驰声评测完成 overall:', assessResult.overall);
 
-    // 3. 提取结果
+    // 4. 提取结果
     const overall = Math.round(assessResult.overall || 0);
     const accuracy = Math.round(assessResult.accuracy || 0);
     const fluency = Math.round(assessResult.fluency || 0);
@@ -47,11 +52,11 @@ module.exports = async (req, res) => {
     }
     const markedWords = [...new Set(lowScoreWords)].join(', ');
 
-    // 4. DeepSeek生成反馈
+    // 5. DeepSeek生成反馈
     console.log('生成AI反馈...');
     const aiFeedback = await generateFeedback({ overall, accuracy, fluency, integrity, markedWords });
 
-    // 5. 写回飞书
+    // 6. 写回飞书
     console.log('写回飞书...');
     await updateFeishuRecord({ recordId, fields: {
       '评测总分': overall,
@@ -93,16 +98,30 @@ async function getFeishuToken() {
   return _token;
 }
 
-// ── 下载飞书附件 ──────────────────────────────────
-async function downloadFeishuFile(fileToken, feishuToken) {
+// ── 用fileToken换临时下载URL ──────────────────────
+async function getFeishuTmpUrl(fileToken, feishuToken) {
+  const tableId = process.env.FEISHU_TABLE_ID;
   const resp = await axios.get(
-    `https://open.feishu.cn/open-apis/drive/v1/medias/${fileToken}/download`,
+    `https://open.feishu.cn/open-apis/drive/v1/medias/batch_get_tmp_download_url?file_tokens=${fileToken}&extra=%7B%22bitablePerm%22%3A%7B%22tableId%22%3A%22${tableId}%22%7D%7D`,
     {
       headers: { Authorization: `Bearer ${feishuToken}` },
-      responseType: 'arraybuffer',
-      timeout: 120000,
+      timeout: 10000,
     }
   );
+  const items = resp.data.data.tmp_download_urls;
+  if (!items || items.length === 0) {
+    throw new Error('获取临时下载URL失败: ' + JSON.stringify(resp.data));
+  }
+  return items[0].tmp_download_url;
+}
+
+// ── 下载文件 ──────────────────────────────────────
+async function downloadFile(url, feishuToken) {
+  const resp = await axios.get(url, {
+    headers: { Authorization: `Bearer ${feishuToken}` },
+    responseType: 'arraybuffer',
+    timeout: 120000,
+  });
   return Buffer.from(resp.data);
 }
 
