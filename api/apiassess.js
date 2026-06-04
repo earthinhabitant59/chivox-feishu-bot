@@ -13,30 +13,30 @@ module.exports = async (req, res) => {
     return res.status(400).json({ error: '缺少必要参数: fileToken, text, recordId' });
   }
 
-  // 立即响应飞书，避免超时
-  res.status(200).json({ status: '评测进行中', recordId });
+  let feishuToken;
+  try {
+    feishuToken = await getFeishuToken();
+  } catch (e) {
+    return res.status(500).json({ error: '获取飞书Token失败: ' + e.message });
+  }
 
   try {
-    // 1. 获取飞书Token
-    const feishuToken = await getFeishuToken();
-
-    // 2. 通过附件ID下载文件
-    console.log(`下载附件 fileToken: ${fileToken}`);
+    // 1. 下载飞书附件
+    console.log('下载附件 fileToken:', fileToken);
     const audioBuffer = await downloadFeishuFile(fileToken, feishuToken);
-    console.log(`附件下载完成，大小: ${audioBuffer.length} bytes`);
+    console.log('附件下载完成，大小:', audioBuffer.length, 'bytes');
 
-    // 3. 调用驰声评测
+    // 2. 驰声评测
     console.log('开始驰声评测...');
     const assessResult = await chivoxAssess(audioBuffer, text);
-    console.log('驰声评测完成:', JSON.stringify(assessResult).slice(0, 300));
+    console.log('驰声评测完成 overall:', assessResult.overall);
 
-    // 4. 提取评测结果
+    // 3. 提取结果
     const overall = Math.round(assessResult.overall || 0);
     const accuracy = Math.round(assessResult.accuracy || 0);
     const fluency = Math.round(assessResult.fluency || 0);
     const integrity = Math.round(assessResult.integrity || 0);
 
-    // 提取标红单词（得分低于60）
     const lowScoreWords = [];
     if (assessResult.words && Array.isArray(assessResult.words)) {
       assessResult.words.forEach(w => {
@@ -47,38 +47,33 @@ module.exports = async (req, res) => {
     }
     const markedWords = [...new Set(lowScoreWords)].join(', ');
 
-    // 5. DeepSeek生成彩虹反馈
+    // 4. DeepSeek生成反馈
     console.log('生成AI反馈...');
     const aiFeedback = await generateFeedback({ overall, accuracy, fluency, integrity, markedWords });
 
-    // 6. 写回飞书
+    // 5. 写回飞书
     console.log('写回飞书...');
-    await updateFeishuRecord({
-      recordId,
-      fields: {
-        '评测总分': overall,
-        '准确度': accuracy,
-        '流利度': fluency,
-        '完整度': integrity,
-        '标红单词': markedWords,
-        'AI反馈': aiFeedback,
-        '反馈状态': '已反馈',
-      }
-    }, feishuToken);
+    await updateFeishuRecord({ recordId, fields: {
+      '评测总分': overall,
+      '准确度': accuracy,
+      '流利度': fluency,
+      '完整度': integrity,
+      '标红单词': markedWords,
+      'AI反馈': aiFeedback,
+      '反馈状态': '已反馈',
+    }}, feishuToken);
 
-    console.log(`记录 ${recordId} 全部完成`);
+    console.log('全部完成 recordId:', recordId);
+    return res.status(200).json({ status: '评测完成', recordId, overall, accuracy, fluency, integrity, markedWords, aiFeedback });
 
   } catch (err) {
     console.error('评测出错:', err.message);
     try {
-      const t = await getFeishuToken();
-      await updateFeishuRecord({
-        recordId,
-        fields: { 'AI反馈': `评测失败: ${err.message}` }
-      }, t);
+      await updateFeishuRecord({ recordId, fields: { 'AI反馈': '评测失败: ' + err.message }}, feishuToken);
     } catch (e) {
       console.error('写回错误状态失败:', e.message);
     }
+    return res.status(500).json({ error: err.message });
   }
 };
 
@@ -105,7 +100,7 @@ async function downloadFeishuFile(fileToken, feishuToken) {
     {
       headers: { Authorization: `Bearer ${feishuToken}` },
       responseType: 'arraybuffer',
-      timeout: 60000,
+      timeout: 120000,
     }
   );
   return Buffer.from(resp.data);
@@ -128,9 +123,9 @@ function chivoxAssess(audioBuffer, text) {
       if (!resolved) {
         resolved = true;
         ws.close();
-        reject(new Error('驰声评测超时（60s）'));
+        reject(new Error('驰声评测超时（180s）'));
       }
-    }, 60000);
+    }, 180000);
 
     ws.on('open', () => {
       console.log('驰声WebSocket连接成功');
@@ -148,10 +143,8 @@ function chivoxAssess(audioBuffer, text) {
         }
       }));
 
-      // 分片发送音频，每片32KB
       const chunkSize = 32 * 1024;
       let offset = 0;
-
       const sendChunk = () => {
         if (offset >= audioBuffer.length) {
           ws.send(JSON.stringify({ end: true }));
@@ -163,7 +156,6 @@ function chivoxAssess(audioBuffer, text) {
         offset += chunkSize;
         setTimeout(sendChunk, 30);
       };
-
       sendChunk();
     });
 
@@ -171,7 +163,6 @@ function chivoxAssess(audioBuffer, text) {
       try {
         const msg = JSON.parse(data.toString());
         console.log('驰声消息 status:', msg.status);
-
         if (msg.status === 0 && msg.result) {
           clearTimeout(timeout);
           resolved = true;
@@ -192,7 +183,7 @@ function chivoxAssess(audioBuffer, text) {
       clearTimeout(timeout);
       if (!resolved) {
         resolved = true;
-        reject(new Error(`驰声WebSocket错误: ${err.message}`));
+        reject(new Error('驰声WebSocket错误: ' + err.message));
       }
     });
 
@@ -200,7 +191,7 @@ function chivoxAssess(audioBuffer, text) {
   });
 }
 
-// ── 写回飞书记录 ──────────────────────────────────
+// ── 写回飞书 ──────────────────────────────────────
 async function updateFeishuRecord({ recordId, fields }, feishuToken) {
   const appToken = process.env.FEISHU_APP_TOKEN;
   const tableId = process.env.FEISHU_TABLE_ID;
@@ -212,7 +203,7 @@ async function updateFeishuRecord({ recordId, fields }, feishuToken) {
         Authorization: `Bearer ${feishuToken}`,
         'Content-Type': 'application/json',
       },
-      timeout: 10000,
+      timeout: 15000,
     }
   );
 }
@@ -220,12 +211,7 @@ async function updateFeishuRecord({ recordId, fields }, feishuToken) {
 // ── DeepSeek生成反馈 ──────────────────────────────
 async function generateFeedback({ overall, accuracy, fluency, integrity, markedWords }) {
   try {
-    const prompt = `你是一位专业的英语指导老师，请根据学生的朗读评测结果，用温暖鼓励的语气写一段30-50字的反馈。
-
-评测结果：总分${overall}分，准确度${accuracy}分，流利度${fluency}分，完整度${integrity}分。${markedWords ? `需要注意的单词：${markedWords}。` : ''}
-
-直接写反馈内容，不加标题。`;
-
+    const prompt = `你是一位专业的英语指导老师，请根据学生的朗读评测结果，用温暖鼓励的语气写一段30-50字的反馈。评测结果：总分${overall}分，准确度${accuracy}分，流利度${fluency}分，完整度${integrity}分。${markedWords ? `需要注意的单词：${markedWords}。` : ''}直接写反馈内容，不加标题。`;
     const resp = await axios.post(
       'https://api.deepseek.com/v1/chat/completions',
       {
@@ -245,6 +231,6 @@ async function generateFeedback({ overall, accuracy, fluency, integrity, markedW
     return resp.data.choices[0].message.content.trim();
   } catch (e) {
     console.error('DeepSeek生成失败:', e.message);
-    return `朗读完成！总分${overall}分，${markedWords ? `注意练习：${markedWords}。` : '继续加油！'}`;
+    return `朗读完成！总分${overall}分。${markedWords ? '注意练习：' + markedWords + '。' : '继续加油！'}`;
   }
 }
