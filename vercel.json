@@ -1,0 +1,7 @@
+{
+  "functions": {
+    "api/apiassess.js": {
+      "maxDuration": 300
+    }
+  }
+}
